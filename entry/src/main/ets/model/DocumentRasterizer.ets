@@ -158,19 +158,6 @@ export class DocumentRasterizer {
     return dst;
   }
 
-  /** 读取文件为字节数组（docx/xlsx 用） */
-  static readFileBytes(uri: string): Uint8Array {
-    const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
-    try {
-      const stat = fs.statSync(file.fd);
-      const buf = new ArrayBuffer(stat.size);
-      fs.readSync(file.fd, buf);
-      return new Uint8Array(buf);
-    } finally {
-      fs.closeSync(file);
-    }
-  }
-
   private static async pageToRgb(ctx: OffscreenCanvasRenderingContext2D, w: number, h: number): Promise<RgbImage> {
     const pm = ctx.getPixelMap(0, 0, w, h);
     const buf = new ArrayBuffer(w * h * 4);

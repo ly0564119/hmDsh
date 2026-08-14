@@ -3,7 +3,9 @@
 一个 **HarmonyOS NEXT（ArkTS）** 原生应用，通过 Wi-Fi 局域网用爱普生 **ESC/P-R** 栅格协议
 直接驱动 **爱普生 L805**（6 色喷墨照片打印机）。不依赖官方 Epson iPrint，也不需要打印机联网。
 
-**支持打印**：纯文本（.txt）、照片、Word（.docx）、Excel（.xlsx）、PDF，并支持**局域网自动发现打印机**。
+**支持打印**：纯文本（.txt）、照片、Word（.docx）、Excel（.xlsx），并支持**局域网自动发现打印机**。
+
+> PDF 暂不支持：当前 SDK 没有公开的 PDF 页面渲染 API，见文末「PDF 说明」。
 
 ## ⚠️ 先说清楚：L805 没有扫描功能
 
@@ -12,13 +14,12 @@ L805 是一台**单功能照片打印机**，硬件上没有扫描仪，任何 A
 
 ## 工作原理
 
-1. 选文件（txt / docx / xlsx / pdf）或相册选图。
+1. 选文件（txt / docx / xlsx）或相册选图。
 2. 光栅化成 RGB 位图：
    - 文本：`OffscreenCanvas` 排版；
    - 照片：`ImageSource` 解码缩放；
    - Word：解 ZIP → `word/document.xml` → 提取文字，按文本打印；
-   - Excel：解 ZIP → `sharedStrings.xml` + `sheet1.xml` → 渲染成带网格线的表格；
-   - PDF：`@kit.PDFKit` 的 `pdfService` 把每页转成图片。
+   - Excel：解 ZIP → `sharedStrings.xml` + `sheet1.xml` → 渲染成带网格线的表格。
 3. 拼装 **ESC/P-R** 打印任务（EJL 握手 + 栅格命令 + RGB888 数据）。
 4. 通过 `@ohos.net.socket` 发送到打印机 **IP:9100**。
 
@@ -49,29 +50,26 @@ L805 是一台**单功能照片打印机**，硬件上没有扫描仪，任何 A
 │   │       ├── PrinterDiscovery.ets   mDNS 发现
 │   │       ├── DocumentRasterizer.ets 文本/图片/表格 → 位图
 │   │       ├── OfficeParser.ets  docx/xlsx XML 解析
-│   │       ├── PdfRasterizer.ets PDF → 图片（PDF Kit）
 │   │       ├── EscPrEncoder.ets  ESC/P-R 编码器（核心）
 │   │       └── PrintService.ets  打印流程编排
 │   └── resources/
-├── build-profile.json5           compatibleSdkVersion = 6.0.0(14)
+├── build-profile.json5           compatibleSdkVersion = 6.1.1(24)
 └── oh-package.json5
 ```
 
 ## 构建与运行
 
-1. 安装 **DevEco Studio 5.0+**（需 **HarmonyOS 6.0 SDK / API 14**，因为 PDF 功能用到了 PDF Kit）。
+1. 安装 **DevEco Studio**（本项目按 **HarmonyOS 6.1.1 / API 24** SDK 配置）。
 2. `File → Open` 打开本工程根目录（`D:\119\workspace\ai\hm`）。
 3. 配置**自动签名**（`File → Project Structure → Signing Configs`）。
-4. 连接 HarmonyOS 6.0 真机，点击 **Run**。
+4. 连接 HarmonyOS 6.1.1（API 24）真机，点击 **Run**。
 
-> **如果你用 HarmonyOS 5.0（API 12/13）设备**：PDF Kit 不可用。请把
-> `build-profile.json5` 里的 `compatibleSdkVersion` 改回 `"5.0.0(12)"`，
-> 并删除 `PdfRasterizer.ets`、`PrintService.ets` 里对 `printPdf`/`PdfRasterizer` 的引用
-> 以及 `Index.ets` 里的“打印 PDF”按钮；其余功能（文本/照片/Word/Excel/发现）不受影响。
+> 如果你用更低的 SDK/设备：把 `build-profile.json5` 里的
+> `compatibleSdkVersion`（以及 `targetSdkVersion`）改成你 SDK 对应的版本即可，
+> 格式为 `平台版本(API 版本)`，例如 `5.0.0(12)`。改完在 DevEco 里 Sync 一下。
 
-> 本工程由 AI 生成，未在 DevEco Studio 实际编译；PDF Kit 的 `pdfService` 方法名
-> （`loadDocument` / `savePageAsImage` / `getPageCount` / `ParseResult`）请按 DevEco
-> 自动补全与 API 参考核对一次，个别名称如有出入微调即可。
+> 本工程由 AI 生成，未在 DevEco Studio 实际编译；如个别 API 类型名/方法名与你的 SDK
+> 有差异，按 IDE 自动补全微调即可。
 
 ## 使用步骤
 
@@ -84,12 +82,20 @@ L805 是一台**单功能照片打印机**，硬件上没有扫描仪，任何 A
 - **.txt**：单字体、单字号、左对齐的简单排版（UTF-8 编码）。
 - **.docx**：**提取文字内容**打印，会丢失字体、字号、颜色、图片、表格等复杂排版——相当于“纯文字版”。
 - **.xlsx**：渲染成**带网格线的表格**，单元格文字自动换行；不保留合并单元格、公式、图表、列宽样式。
-- **.pdf**：整页转图片打印，**等比缩放并居中**到纸张。
 - **照片**：等比缩放居中，纸张边距按官方 300dpi 表换算。
 - **4x6 照片**暂映射到“明信片”规格（100×148mm），与 4x6（102×152mm）略有差异。
 
-这些都是“内容优先”的轻量实现，达不到 WPS / 官方驱动的排版还原度。若要像素级还原，
-需要引入专业渲染引擎（如 Foxit PDFSDK-Harmony 等），可作为后续迭代。
+这些都是“内容优先”的轻量实现，达不到 WPS / 官方驱动的排版还原度。
+
+## PDF 说明
+
+当前 HarmonyOS 6.1.1（API 24）的公开 SDK 里**没有** PDF 页面渲染 API（`@kit.PDFKit` /
+`pdfService` / `PdfReader` 均未在 SDK 中暴露），所以本项目暂未内置 PDF 打印。
+
+如需 PDF 打印，可行方向（需另行接入）：
+- 引入第三方 ohpm PDF 渲染库（如 OpenHarmony-TPC 的 pdfViewer 系列，多为 native 库，需 NDK 编译）；
+- 使用商业 SDK（如 Foxit PDFSDK-Harmony），按它的授权方式集成；
+- 或用 PDF 阅读器/系统能力先把 PDF 导出为图片再打印。
 
 ## 常见问题
 

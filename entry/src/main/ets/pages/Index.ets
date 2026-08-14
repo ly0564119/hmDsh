@@ -125,17 +125,11 @@ struct Index {
     }
     const uri = uris[0];
     let content = '';
-    let file: fs.File | null = null;
     try {
-      file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
-      content = fs.readTextSync(file.fd);
+      content = fs.readTextSync(uri);
     } catch (e) {
       this.status = '读取文件失败（请使用 UTF-8 编码的 .txt）';
       return;
-    } finally {
-      if (file !== null) {
-        fs.closeSync(file);
-      }
     }
     if (content.length === 0) {
       this.status = '文件内容为空';
@@ -171,12 +165,12 @@ struct Index {
     );
   }
 
-  /** 打印 Office / PDF：kind ∈ {docx, xlsx, pdf} */
+  /** 打印 Office：kind ∈ {docx, xlsx} */
   private async pickAndPrintOffice(kind: string): Promise<void> {
     if (!this.validateIp()) {
       return;
     }
-    const suffix = kind === 'pdf' ? '.pdf' : (kind === 'docx' ? '.docx' : '.xlsx');
+    const suffix = kind === 'docx' ? '.docx' : '.xlsx';
     const docPicker = new picker.DocumentViewPicker();
     const opts = new picker.DocumentSelectOptions();
     opts.maxSelectNumber = 1;
@@ -196,15 +190,11 @@ struct Index {
     const ctx = getContext(this) as common.UIAbilityContext;
     if (kind === 'docx') {
       await this.runTask(() =>
-        this.service.printDocx(this.ip, uri, this.dpi(), this.paper(), this.fontSizePx(), this.marginPx())
-      );
-    } else if (kind === 'xlsx') {
-      await this.runTask(() =>
-        this.service.printXlsx(this.ip, uri, this.dpi(), this.paper(), this.fontSizePx(), this.marginPx())
+        this.service.printDocx(this.ip, uri, this.dpi(), this.paper(), this.fontSizePx(), this.marginPx(), ctx.cacheDir)
       );
     } else {
       await this.runTask(() =>
-        this.service.printPdf(this.ip, uri, this.dpi(), this.paper(), ctx.cacheDir)
+        this.service.printXlsx(this.ip, uri, this.dpi(), this.paper(), this.fontSizePx(), this.marginPx(), ctx.cacheDir)
       );
     }
   }
@@ -310,13 +300,6 @@ struct Index {
           .enabled(!this.busy)
           .onClick(() => {
             this.pickAndPrintOffice('xlsx');
-          })
-
-        Button('打印 PDF')
-          .width('100%')
-          .enabled(!this.busy)
-          .onClick(() => {
-            this.pickAndPrintOffice('pdf');
           })
 
         Text(this.status)
