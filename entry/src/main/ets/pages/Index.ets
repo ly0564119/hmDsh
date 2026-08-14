@@ -21,8 +21,15 @@ struct Index {
   @State qualityIndex: number = 0;  // 0 标准 300 / 1 高 600
   private service: PrintService = new PrintService();
   private discovery: PrinterDiscovery = new PrinterDiscovery();
-  private paperList: string[] = ['A4', 'Letter', '4x6 / 明信片'];
-  private qualityList: string[] = ['标准 (300dpi)', '高质量 (600dpi)'];
+  private paperOptions: SelectOption[] = [
+    { value: 'A4' },
+    { value: 'Letter' },
+    { value: '4x6 / 明信片' }
+  ];
+  private qualityOptions: SelectOption[] = [
+    { value: '标准 (300dpi)' },
+    { value: '高质量 (600dpi)' }
+  ];
 
   aboutToAppear(): void {
     PersistentStorage.persistProp('printer_ip', '');
@@ -247,11 +254,11 @@ struct Index {
             .fontSize(13)
             .foregroundColor('#666666')
             .width('100%')
-          Select(this.paperList)
+          Select(this.paperOptions)
             .selected(this.paperIndex)
-            .value(this.paperList[this.paperIndex])
+            .value(this.paperOptions[this.paperIndex].value)
             .width('100%')
-            .onSelect((index: number) => {
+            .onSelect((index: number, value: string) => {
               this.paperIndex = index;
             })
         }
@@ -263,11 +270,11 @@ struct Index {
             .fontSize(13)
             .foregroundColor('#666666')
             .width('100%')
-          Select(this.qualityList)
+          Select(this.qualityOptions)
             .selected(this.qualityIndex)
-            .value(this.qualityList[this.qualityIndex])
+            .value(this.qualityOptions[this.qualityIndex].value)
             .width('100%')
-            .onSelect((index: number) => {
+            .onSelect((index: number, value: string) => {
               this.qualityIndex = index;
             })
         }
