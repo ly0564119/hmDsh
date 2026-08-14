@@ -1,0 +1,9 @@
+{
+  "modelVersion": "5.0.0",
+  "description": "爱普生 L805 打印驱动（ESC/P-R over Wi-Fi）",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hypium": "1.0.19",
+    "@ohos/hamock": "1.0.0"
+  }
+}
