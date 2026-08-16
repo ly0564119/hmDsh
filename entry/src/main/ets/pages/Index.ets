@@ -1,10 +1,18 @@
 import { promptAction } from '@kit.ArkUI';
-import { picker, fileIo as fs } from '@kit.CoreFileKit';
+import { picker } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { common } from '@kit.AbilityKit';
-import { PrintService } from '../model/PrintService';
-import { EscPrDpi, EscPrPaper } from '../model/EscPrEncoder';
+import { BusinessError } from '@kit.BasicServicesKit';
+import { PrintRequest, PrintService } from '../model/PrintService';
+import {
+  EscPrColorMode,
+  EscPrDpi,
+  EscPrJobOptions,
+  EscPrMediaType,
+  EscPrQuality
+} from '../model/EscPrEncoder';
+import { Constants, PaperSpec } from '../common/Constants';
 import { PrinterDiscovery, DiscoveredPrinter } from '../model/PrinterDiscovery';
 
 const TAG: string = 'L805Index';
@@ -17,18 +25,50 @@ struct Index {
   @State busy: boolean = false;
   @State discovering: boolean = false;
   @State foundList: DiscoveredPrinter[] = [];
-  @State paperIndex: number = 0;    // 0 A4 / 1 Letter / 2 明信片
-  @State qualityIndex: number = 0;  // 0 标准 300 / 1 高 600
+  @State paperIndex: number = 0;
+  @State qualityIndex: number = 0;
+  @State mediaIndex: number = 0;
+  @State colorIndex: number = 0;
   private service: PrintService = new PrintService();
   private discovery: PrinterDiscovery = new PrinterDiscovery();
+
+  /** 纸张选项与规格一一对应 */
+  private paperSpecs: PaperSpec[] = [
+    Constants.PAPER_A4,
+    Constants.PAPER_LETTER,
+    Constants.PAPER_A5,
+    Constants.PAPER_POSTCARD,
+    Constants.PAPER_4X6,
+    Constants.PAPER_5X7
+  ];
   private paperOptions: SelectOption[] = [
     { value: 'A4' },
     { value: 'Letter' },
-    { value: '4x6 / 明信片' }
+    { value: 'A5' },
+    { value: '明信片 100×148' },
+    { value: '4×6 照片' },
+    { value: '5×7 照片' }
   ];
   private qualityOptions: SelectOption[] = [
-    { value: '标准 (300dpi)' },
-    { value: '高质量 (600dpi)' }
+    { value: '标准（360dpi）' },
+    { value: '高质量（720dpi）' }
+  ];
+  /** 介质选项与 ESC/P-R 的 MTID 一一对应 */
+  private mediaTypes: number[] = [
+    EscPrMediaType.PLAIN,
+    EscPrMediaType.PHOTO,
+    EscPrMediaType.PREMIUM_GLOSSY,
+    EscPrMediaType.MATTE
+  ];
+  private mediaOptions: SelectOption[] = [
+    { value: '普通纸' },
+    { value: '照片纸（光面）' },
+    { value: '高级光面照片纸' },
+    { value: '亚光纸' }
+  ];
+  private colorOptions: SelectOption[] = [
+    { value: '彩色' },
+    { value: '黑白' }
   ];
 
   aboutToAppear(): void {
@@ -39,26 +79,24 @@ struct Index {
     }
   }
 
-  private dpi(): number {
-    return this.qualityIndex === 0 ? EscPrDpi.LOW : EscPrDpi.HIGH;
+  /** 按界面选择组装 ESC/P-R 作业参数 */
+  private buildOptions(): EscPrJobOptions {
+    const options = new EscPrJobOptions();
+    options.dpi = this.qualityIndex === 1 ? EscPrDpi.HIGH : EscPrDpi.STANDARD;
+    options.paper = this.paperSpecs[this.paperIndex];
+    options.mediaType = this.mediaTypes[this.mediaIndex];
+    // 高分辨率配高质量档，普通纸默认标准档
+    options.quality = this.qualityIndex === 1 ? EscPrQuality.HIGH : EscPrQuality.NORMAL;
+    options.colorMode = this.colorIndex === 1 ? EscPrColorMode.MONOCHROME : EscPrColorMode.COLOR;
+    return options;
   }
 
-  private paper(): number {
-    if (this.paperIndex === 1) {
-      return EscPrPaper.LETTER;
-    }
-    if (this.paperIndex === 2) {
-      return EscPrPaper.POSTCARD;
-    }
-    return EscPrPaper.A4;
-  }
-
-  private fontSizePx(): number {
-    return Math.round(11 / 72 * this.dpi());
-  }
-
-  private marginPx(): number {
-    return Math.round(8 / 25.4 * this.dpi());
+  private buildRequest(): PrintRequest {
+    const req = new PrintRequest(this.ip, this.buildOptions());
+    req.progress = (message: string) => {
+      this.status = message;
+    };
+    return req;
   }
 
   private validateIp(): boolean {
@@ -81,9 +119,11 @@ struct Index {
       this.status = '打印完成，共 ' + pages + ' 页';
       promptAction.showToast({ message: '打印完成' });
     } catch (e) {
-      hilog.error(0x0000, TAG, 'print task failed');
-      this.status = '打印失败，请检查打印机 IP 与网络';
-      promptAction.showToast({ message: '打印失败，请检查打印机 IP 与网络' });
+      const err = e as BusinessError;
+      const detail = (err.message !== undefined && err.message.length > 0) ? err.message : '未知错误';
+      hilog.error(0x0000, TAG, 'print task failed: %{public}s', detail);
+      this.status = '打印失败：' + detail;
+      promptAction.showToast({ message: '打印失败：' + detail });
     } finally {
       this.busy = false;
     }
@@ -104,10 +144,30 @@ struct Index {
         this.status = '发现 ' + list.length + ' 台设备，点击填入 IP';
       }
     } catch (e) {
-      hilog.error(0x0000, TAG, 'discovery failed');
+      const err = e as BusinessError;
+      hilog.error(0x0000, TAG, 'discovery failed: %{public}s', err.message);
       this.status = '扫描失败，请手动输入 IP';
     } finally {
       this.discovering = false;
+    }
+  }
+
+  /** 选文件：返回选中的 URI，取消或失败返回空串 */
+  private async pickDocument(suffix: string): Promise<string> {
+    const docPicker = new picker.DocumentViewPicker();
+    const opts = new picker.DocumentSelectOptions();
+    opts.maxSelectNumber = 1;
+    opts.fileSuffixFilters = [suffix];
+    try {
+      const uris = await docPicker.select(opts);
+      if (uris.length === 0) {
+        this.status = '未选择文件';
+        return '';
+      }
+      return uris[0];
+    } catch (e) {
+      this.status = '已取消选择文件';
+      return '';
     }
   }
 
@@ -115,36 +175,23 @@ struct Index {
     if (!this.validateIp()) {
       return;
     }
-    const docPicker = new picker.DocumentViewPicker();
-    const opts = new picker.DocumentSelectOptions();
-    opts.maxSelectNumber = 1;
-    opts.fileSuffixFilters = ['.txt'];
-    let uris: string[] = [];
-    try {
-      uris = await docPicker.select(opts);
-    } catch (e) {
-      this.status = '已取消选择文件';
+    const uri = await this.pickDocument('.txt');
+    if (uri.length === 0) {
       return;
     }
-    if (uris.length === 0) {
-      this.status = '未选择文件';
-      return;
-    }
-    const uri = uris[0];
     let content = '';
     try {
-      content = fs.readTextSync(uri);
+      content = PrintService.readTextFile(uri);
     } catch (e) {
-      this.status = '读取文件失败（请使用 UTF-8 编码的 .txt）';
+      const err = e as BusinessError;
+      this.status = '读取文件失败：' + err.message;
       return;
     }
-    if (content.length === 0) {
+    if (content.trim().length === 0) {
       this.status = '文件内容为空';
       return;
     }
-    await this.runTask(() =>
-      this.service.printText(this.ip, content, this.dpi(), this.paper(), this.fontSizePx(), this.marginPx())
-    );
+    await this.runTask(() => this.service.printText(this.buildRequest(), content));
   }
 
   private async pickAndPrintPhoto(): Promise<void> {
@@ -167,9 +214,7 @@ struct Index {
       return;
     }
     const uri = result.photoUris[0];
-    await this.runTask(() =>
-      this.service.printPhoto(this.ip, uri, this.dpi(), this.paper())
-    );
+    await this.runTask(() => this.service.printPhoto(this.buildRequest(), uri));
   }
 
   /** 打印 Office：kind ∈ {docx, xlsx} */
@@ -177,32 +222,15 @@ struct Index {
     if (!this.validateIp()) {
       return;
     }
-    const suffix = kind === 'docx' ? '.docx' : '.xlsx';
-    const docPicker = new picker.DocumentViewPicker();
-    const opts = new picker.DocumentSelectOptions();
-    opts.maxSelectNumber = 1;
-    opts.fileSuffixFilters = [suffix];
-    let uris: string[] = [];
-    try {
-      uris = await docPicker.select(opts);
-    } catch (e) {
-      this.status = '已取消选择文件';
+    const isWord = kind === 'docx';
+    const uri = await this.pickDocument(isWord ? '.docx' : '.xlsx');
+    if (uri.length === 0) {
       return;
     }
-    if (uris.length === 0) {
-      this.status = '未选择文件';
-      return;
-    }
-    const uri = uris[0];
-    const ctx = getContext(this) as common.UIAbilityContext;
-    if (kind === 'docx') {
-      await this.runTask(() =>
-        this.service.printDocx(this.ip, uri, this.dpi(), this.paper(), this.fontSizePx(), this.marginPx(), ctx.cacheDir)
-      );
+    if (isWord) {
+      await this.runTask(() => this.service.printDocx(this.buildRequest(), uri));
     } else {
-      await this.runTask(() =>
-        this.service.printXlsx(this.ip, uri, this.dpi(), this.paper(), this.fontSizePx(), this.marginPx(), ctx.cacheDir)
-      );
+      await this.runTask(() => this.service.printXlsx(this.buildRequest(), uri));
     }
   }
 
@@ -258,6 +286,7 @@ struct Index {
             .selected(this.paperIndex)
             .value(this.paperOptions[this.paperIndex].value)
             .width('100%')
+            .enabled(!this.busy)
             .onSelect((index: number, value: string) => {
               this.paperIndex = index;
             })
@@ -274,8 +303,43 @@ struct Index {
             .selected(this.qualityIndex)
             .value(this.qualityOptions[this.qualityIndex].value)
             .width('100%')
+            .enabled(!this.busy)
             .onSelect((index: number, value: string) => {
               this.qualityIndex = index;
+            })
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        Column({ space: 8 }) {
+          Text('纸张类型')
+            .fontSize(13)
+            .foregroundColor('#666666')
+            .width('100%')
+          Select(this.mediaOptions)
+            .selected(this.mediaIndex)
+            .value(this.mediaOptions[this.mediaIndex].value)
+            .width('100%')
+            .enabled(!this.busy)
+            .onSelect((index: number, value: string) => {
+              this.mediaIndex = index;
+            })
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+
+        Column({ space: 8 }) {
+          Text('色彩')
+            .fontSize(13)
+            .foregroundColor('#666666')
+            .width('100%')
+          Select(this.colorOptions)
+            .selected(this.colorIndex)
+            .value(this.colorOptions[this.colorIndex].value)
+            .width('100%')
+            .enabled(!this.busy)
+            .onSelect((index: number, value: string) => {
+              this.colorIndex = index;
             })
         }
         .width('100%')
