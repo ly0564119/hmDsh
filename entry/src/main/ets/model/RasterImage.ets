@@ -17,11 +17,6 @@ export class RgbImage {
     this.data = new Uint8Array(width * height * 3);
   }
 
-  /** 整幅填白（打印底色是纸的白色） */
-  fillWhite(): void {
-    this.data.fill(255);
-  }
-
   /** 第 y 行在 data 中的起始下标 */
   rowOffset(y: number): number {
     return y * this.width * 3;
@@ -80,20 +75,5 @@ export class RgbImage {
       }
     }
     return img;
-  }
-
-  /** 读取 (x, y) 的 RGB，写入 out 数组（长度 >= 3） */
-  getPixel(x: number, y: number, out: number[]): void {
-    const o = (y * this.width + x) * 3;
-    out[0] = this.data[o];
-    out[1] = this.data[o + 1];
-    out[2] = this.data[o + 2];
-  }
-
-  setPixel(x: number, y: number, r: number, g: number, b: number): void {
-    const o = (y * this.width + x) * 3;
-    this.data[o] = r;
-    this.data[o + 1] = g;
-    this.data[o + 2] = b;
   }
 }

@@ -98,16 +98,4 @@ export class TextFont {
     this.widthCache.set(ch, w);
     return w;
   }
-
-  /** 整串宽度（按单字宽累加，与排版时的换行判断保持一致） */
-  measure(text: string): number {
-    let sum = 0;
-    let i = 0;
-    while (i < text.length) {
-      const len = TextFont.charLengthAt(text, i);
-      sum += this.charWidth(text.substring(i, i + len));
-      i += len;
-    }
-    return sum;
-  }
 }
