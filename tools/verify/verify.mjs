@@ -393,6 +393,33 @@ async function main() {
     check('进入 ESC/P-R', jobHex.indexOf('1b28520600' + '00' + Buffer.from('ESCPR', 'ascii').toString('hex')) >= 0);
     check('退出远程模式', jobHex.indexOf('1b000000') >= 0);
 
+    // REMOTE1 区块：每条命令 = 命令名(2B) + 长度(2B 小端) + 参数，长度含开头那个固定的 0x00
+    {
+      const remoteStart = jobHex.indexOf('1b285208') / 2 + 6 + 7; // 跳过 ESC ( R len 00 "REMOTE1"
+      let p = remoteStart;
+      const names = [];
+      while (p < job.length) {
+        if (job[p] === 0x1b) {
+          break; // 遇到 ESC 00 00 00，远程区块结束
+        }
+        const name = String.fromCharCode(job[p], job[p + 1]);
+        const len = job[p + 2] | (job[p + 3] << 8);
+        names.push(`${name}:${len}`);
+        if (len > 0 && job[p + 4] !== 0x00) {
+          throw new Error(`远程命令 ${name} 的首个参数字节应为 0x00`);
+        }
+        p += 4 + len;
+      }
+      check('远程命令帧长度自洽', names.join(' ') === 'TI:8 JS:4 JH:14 PP:3', names.join(' '));
+      check('远程区块后紧跟退出远程模式',
+        job[p] === 0x1b && job[p + 1] === 0 && job[p + 2] === 0 && job[p + 3] === 0,
+        Buffer.from(job.subarray(p, p + 4)).toString('hex'));
+      // JH 的作业名应是 8 字节可打印 ASCII
+      const jhAt = jobHex.indexOf(Buffer.from('JH', 'ascii').toString('hex') + '0e00') / 2;
+      const jobName = Buffer.from(job.subarray(jhAt + 4 + 6, jhAt + 4 + 14)).toString('ascii');
+      check('作业名为 8 字节 ASCII', /^[\x20-\x7e]{8}$/.test(jobName), JSON.stringify(jobName));
+    }
+
     // 逐条命令解析
     const escprStart = jobHex.indexOf('1b285206') / 2 + 11;
     let pos = escprStart;
