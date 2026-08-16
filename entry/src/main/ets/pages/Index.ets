@@ -97,7 +97,10 @@ struct Index {
   }
 
   aboutToDisappear(): void {
-    this.discardPreview();
+    // 正在打印时不能释放作业持有的位图，否则渲染中的页面会崩；交给 GC 回收
+    if (!this.busy) {
+      this.discardPreview();
+    }
   }
 
   /** 按界面选择组装 ESC/P-R 作业参数 */
