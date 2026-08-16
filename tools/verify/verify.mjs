@@ -286,6 +286,18 @@ async function main() {
       `${geo.printableWidth}x${geo.printableHeight}`);
     const geo720 = new escpr.EscPrGeometry(720, Constants.PAPER_4X6);
     check('4x6@720 可打印区为正', geo720.printableWidth > 0 && geo720.printableHeight > 0);
+    // 打印预览要按「整张纸 + 内容平移到可打印区」绘制，这几个量必须自洽
+    for (const paper of [Constants.PAPER_A4, Constants.PAPER_LETTER, Constants.PAPER_A5,
+      Constants.PAPER_POSTCARD, Constants.PAPER_4X6, Constants.PAPER_5X7]) {
+      for (const dpi of [360, 720]) {
+        const g = new escpr.EscPrGeometry(dpi, paper);
+        const fits = g.marginLeft + g.printableWidth <= g.paperWidth &&
+          g.marginTop + g.printableHeight <= g.paperHeight &&
+          g.marginLeft > 0 && g.marginTop > 0;
+        check(`${paper.name}@${dpi} 可打印区落在纸内`, fits,
+          `纸 ${g.paperWidth}x${g.paperHeight} 边距 ${g.marginLeft},${g.marginTop} 内容 ${g.printableWidth}x${g.printableHeight}`);
+      }
+    }
     check('分辨率代码映射',
       escpr.EscPrDpi.toCode(360) === 0 && escpr.EscPrDpi.toCode(720) === 1 &&
       escpr.EscPrDpi.toCode(300) === 2 && escpr.EscPrDpi.toCode(600) === 3);
