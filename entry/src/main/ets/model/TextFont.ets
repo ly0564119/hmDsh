@@ -24,19 +24,13 @@ export class TextFont {
     this.sizePx = sizePx;
     this.font = new drawing.Font();
     this.font.setSize(sizePx);
+    // HarmonyOS drawing.Font 的伪粗体接口是 enableEmbolden，没有 setEmbolden
     if (bold) {
-      try {
-        this.font.setEmbolden(true);
-      } catch (e) {
-        // 个别机型没有伪粗体接口，用默认字重继续
-      }
+      this.font.enableEmbolden(true);
     }
+    // 负 skewX 让字形向右倾，模拟斜体（API 12+）
     if (italic) {
-      try {
-        this.font.setSkewX(-0.25);
-      } catch (e) {
-        // 没有伪斜体就保持正体
-      }
+      this.font.setSkewX(-0.25);
     }
     try {
       const metrics = this.font.getMetrics();
