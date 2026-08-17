@@ -306,6 +306,15 @@ struct Index {
     }
   }
 
+  /** 选 PDF 文件，解析后生成预览 */
+  private async pickPdf(): Promise<void> {
+    const uri = await this.pickDocument('.pdf');
+    if (uri.length === 0) {
+      return;
+    }
+    await this.loadAndPreview(() => PrintService.loadPdf(uri, this.fileNameOf(uri)));
+  }
+
   /** 确认预览后真正开始打印 */
   private async startPrint(): Promise<void> {
     const job = this.job;
@@ -507,6 +516,14 @@ struct Index {
             })
         }
         .width('100%')
+
+        Button('PDF')
+          .width('100%')
+          .fontSize(14)
+          .enabled(!this.busy && !this.preparing)
+          .onClick(() => {
+            this.pickPdf();
+          })
 
         if (this.previewImage !== undefined) {
           Column({ space: 10 }) {

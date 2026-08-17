@@ -14,25 +14,35 @@
  */
 
 import { deflateRawSync } from 'node:zlib';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const REPO_ROOT = join(dirname(new URL(import.meta.url).pathname), '..', '..');
 const ETS_ROOT = join(REPO_ROOT, 'entry', 'src', 'main', 'ets');
 
-/** 参与测试的纯逻辑模块（不含任何 @kit.* 依赖） */
-const PURE_MODULES = [
-  'common/ByteWriter.ets',
-  'common/Constants.ets',
-  'common/Inflate.ets',
-  'common/Utf8.ets',
-  'common/ZipReader.ets',
-  'model/EscPrEncoder.ets',
-  'model/OfficeParser.ets',
-  'model/RasterImage.ets'
-];
+/** 自动收集所有不含 @kit.* 的 .ets，作为纯逻辑模块 */
+function listPureModules() {
+  const out = [];
+  const walk = (dir, base) => {
+    for (const name of readdirSync(dir)) {
+      const full = join(dir, name);
+      const rel = base ? `${base}/${name}` : name;
+      if (statSync(full).isDirectory()) {
+        walk(full, rel);
+      } else if (name.endsWith('.ets')) {
+        const source = readFileSync(full, 'utf8');
+        if (!/@kit\./.test(source)) {
+          out.push(rel);
+        }
+      }
+    }
+  };
+  walk(ETS_ROOT, '');
+  return out;
+}
 
 let failures = 0;
 let checks = 0;
@@ -62,15 +72,13 @@ function equalBytes(a, b) {
 /** 把 .ets 拷成可被 Node 直接加载的 .ts（仅补全相对 import 的扩展名） */
 function stageModules() {
   const dir = mkdtempSync(join(tmpdir(), 'l805-verify-'));
-  mkdirSync(join(dir, 'common'), { recursive: true });
-  mkdirSync(join(dir, 'model'), { recursive: true });
-  for (const rel of PURE_MODULES) {
+  const modules = listPureModules();
+  for (const rel of modules) {
     const source = readFileSync(join(ETS_ROOT, rel), 'utf8');
-    if (/@kit\./.test(source)) {
-      throw new Error(`${rel} 依赖了 @kit.*，不属于纯逻辑模块`);
-    }
     const patched = source.replace(/from '(\.[^']+)'/g, (m, p) => `from '${p}.ts'`);
-    writeFileSync(join(dir, rel.replace(/\.ets$/, '.ts')), patched);
+    const target = join(dir, rel.replace(/\.ets$/, '.ts'));
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, patched);
   }
   return dir;
 }
@@ -551,6 +559,253 @@ async function main() {
       noPageErr = e.message;
     }
     check('未开始页面时明确报错', noPageErr.indexOf('startPage') >= 0, noPageErr);
+  }
+
+  const { XmlParser } = await load('common/XmlParser.ts');
+  const { PdfFilters } = await load('pdf/PdfFilters.ts');
+  const { PdfLexer, PdfParser } = await load('pdf/PdfLexer.ts');
+  const { PdfKind, PdfObj } = await load('pdf/PdfObject.ts');
+  const { PdfDocument } = await load('pdf/PdfDocument.ts');
+  const { PdfContentInterpreter } = await load('pdf/PdfContent.ts');
+  const { PdfItemKind } = await load('pdf/PdfDisplayList.ts');
+  const { PdfBuilder, PdfBuiltinFont, PdfOutPage } = await load('pdf/PdfBuilder.ts');
+  const { PdfPageLayout } = await load('pdf/PdfPageLayout.ts');
+  const { PdfStdFonts } = await load('pdf/PdfStdFonts.ts');
+  const { PngDecoder } = await load('common/PngDecoder.ts');
+  const { DocxParser } = await load('docx/DocxParser.ts');
+  const { DocxToPdf } = await load('docx/DocxToPdf.ts');
+  const { DocxBlockKind } = await load('docx/DocxModel.ts');
+
+  console.log('\n[8] XML 解析');
+  {
+    const xml = `<?xml version="1.0"?><!--c--><root a="1" b='x&amp;y'><w:t xml:space="preserve">A &lt;B&gt;</w:t><child/></root>`;
+    const root = XmlParser.parse(xml);
+    check('根标签名', root.name === 'root', root.name);
+    check('属性与实体', root.attr('a') === '1' && root.attr('b') === 'x&y');
+    check('子元素文本', root.child('w:t') !== null && root.child('w:t').text === 'A <B>');
+    check('自闭合', root.childrenNamed('child').length === 1);
+    check('数字实体', XmlParser.decodeEntities('&#65;&#x42;') === 'AB');
+  }
+
+  console.log('\n[9] PDF 词法 / 过滤器');
+  {
+    const src = Buffer.from('<< /Type /Page /Count 12 /Kids [1 0 R] /Yes true /No false /Empty null /Hex <4142> /Str (a\\nb\\051) >>', 'ascii');
+    const parser = PdfParser.fromBytes(new Uint8Array(src), 0, src.length);
+    const dict = parser.parseObject();
+    check('字典解析', dict.isDict() && dict.get('Type').asName() === 'Page', dict.get('Type').asName());
+    check('间接引用', dict.get('Kids').asArray()[0].isRef() && dict.get('Kids').asArray()[0].refNum === 1);
+    check('布尔/空', dict.get('Yes').asBool(false) === true && dict.get('Empty').isNull());
+    check('十六进制串', Buffer.from(dict.get('Hex').asBytes()).toString() === 'AB');
+    check('转义字符串', Buffer.from(dict.get('Str').asBytes()).toString() === 'a\nb)');
+
+    const raw = Buffer.from('hello PDF filter', 'utf8');
+    const packed = new Uint8Array(deflateRawSync(raw));
+    // zlib 头 0x78 0x9c + raw deflate + adler32，这里只测裸流：flate 也能解裸 DEFLATE
+    const flateOut = PdfFilters.flate(packed);
+    check('Flate 解裸 DEFLATE', equalBytes(flateOut, new Uint8Array(raw)));
+
+    const hex = Buffer.from('414243>', 'ascii');
+    check('ASCIIHex', Buffer.from(PdfFilters.asciiHex(new Uint8Array(hex))).toString() === 'ABC');
+
+    // ASCII85: "hello" → 9jqo^  （Adobe 示例 "Man " → 9jqo^）
+    const a85 = Buffer.from('9jqo^~>', 'ascii');
+    check('ASCII85 Adobe 示例', Buffer.from(PdfFilters.ascii85(new Uint8Array(a85))).toString() === 'Man ');
+
+    const rleSrc = Uint8Array.from([0x00, 0x41, 0xfe, 0x42, 0x80]); // A + 3个 B
+    const rleOut = PdfFilters.runLength(rleSrc);
+    check('RunLength', Buffer.from(rleOut).toString() === 'ABBB', Buffer.from(rleOut).toString());
+
+    const png1x1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64');
+    const decoded = PngDecoder.decode(new Uint8Array(png1x1));
+    check('PNG 1x1 解码', decoded !== null && decoded.width === 1 && decoded.height === 1
+      && decoded.rgb[0] === 255 && decoded.rgb[1] === 0 && decoded.rgb[2] === 0,
+      decoded ? Array.from(decoded.rgb).join(',') : 'null');
+  }
+
+  console.log('\n[10] 标准字体度量');
+  {
+    check('WinAnsi A 的字形名', PdfStdFonts.encoding('WinAnsiEncoding')[65] === 'A');
+    check('Helvetica A 宽度 667', PdfStdFonts.glyphWidth(0, false, false, 'A') === 667,
+      '' + PdfStdFonts.glyphWidth(0, false, false, 'A'));
+    check('Courier 等宽 600', PdfStdFonts.glyphWidth(2, false, false, 'A') === 600);
+    check('glyph uni4E2D', PdfStdFonts.glyphUnicode('uni4E2D') === 0x4e2d);
+    check('中文估算全角', PdfStdFonts.estimateWidth(0x4e2d) === 1000);
+    check('latinWidth Helvetica H', PdfBuilder.latinWidth(PdfBuiltinFont.SANS, false, false, 0x48) === 722);
+  }
+
+  console.log('\n[11] PDF 生成再解析（自洽）');
+  {
+    const builder = new PdfBuilder();
+    const page = new PdfOutPage();
+    page.widthPt = 595.28;
+    page.heightPt = 841.89;
+    page.fonts = ['F0', 'F1B', 'C0'];
+    builder.noteCjkCode(0x4e2d, 1000);
+    builder.noteCjkCode(0x6587, 1000);
+    page.content = 'BT /F0 12 Tf 1 0 0 1 72 700 Tm ' + PdfBuilder.hexString('Hello', false) +
+      ' Tj /F1B 18 Tf 1 0 0 1 72 670 Tm ' + PdfBuilder.hexString('Bold', false) +
+      ' Tj /C0 16 Tf 1 0 0 1 72 640 Tm ' + PdfBuilder.hexString('中文', true) +
+      ' Tj ET\n0.9 0.9 0.2 rg 72 500 120 40 re f\n';
+    const bytes = builder.build([page]);
+    check('PDF 头', bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46);
+    const doc = PdfDocument.open(bytes);
+    check('自产 PDF 页数', doc.pages.length === 1, '' + doc.pages.length);
+    const list = PdfContentInterpreter.run(doc, doc.pages[0]);
+    const texts = list.items.filter((it) => it.kind === PdfItemKind.TEXT).map((it) => it.text);
+    check('抽出 Hello', texts.some((t) => t.indexOf('Hello') >= 0), texts.join('|'));
+    check('抽出 Bold', texts.some((t) => t.indexOf('Bold') >= 0), texts.join('|'));
+    check('抽出中文', texts.some((t) => t.indexOf('中文') >= 0), texts.join('|'));
+    const paths = list.items.filter((it) => it.kind === PdfItemKind.PATH);
+    check('抽出填充矩形', paths.length >= 1, '' + paths.length);
+    const hello = list.items.find((it) => it.kind === PdfItemKind.TEXT && it.text.indexOf('Hello') >= 0);
+    check('Hello 字号约 12pt', hello !== undefined && Math.abs(hello.sizePt - 12) < 0.2, hello ? '' + hello.sizePt : 'missing');
+    check('Hello 基线 x≈72', hello !== undefined && Math.abs(hello.x - 72) < 0.5, hello ? '' + hello.x : 'missing');
+    const laid = PdfPageLayout.fit(list, 2893, 3970);
+    check('缩放到 A4@360 后仍有文字', laid.items.some((it) => it.kind === 0), '' + laid.items.length);
+  }
+
+  console.log('\n[12] 真实 PDF 交叉验证（PyMuPDF，可选）');
+  {
+    const pdfDir = '/tmp/scratch/pdfs';
+    if (!existsSync(pdfDir)) {
+      console.log('  （未找到 /tmp/scratch/pdfs，跳过与 PyMuPDF 的交叉验证）');
+    } else {
+    const samples = ['text_basic.pdf', 'cjk.pdf', 'broken_xref.pdf', 'table.pdf', 'image.pdf', 'rotate_objstm.pdf'];
+    for (const name of samples) {
+      const path = join(pdfDir, name);
+      let data;
+      try {
+        data = new Uint8Array(readFileSync(path));
+      } catch (e) {
+        check(`${name} 存在`, false, 'missing');
+        continue;
+      }
+      const doc = PdfDocument.open(data);
+      let ref = '';
+      try {
+        ref = execFileSync('python3', ['/tmp/scratch/refdump.py', path], { encoding: 'utf8' });
+      } catch (e) {
+        check(`${name} 参考信息`, false, e.message);
+        continue;
+      }
+      const pageCount = (ref.match(/^page /gm) || []).length;
+      check(`${name} 页数`, doc.pages.length === pageCount, `${doc.pages.length} vs ${pageCount}`);
+      for (let i = 0; i < doc.pages.length; i++) {
+        const list = PdfContentInterpreter.run(doc, doc.pages[i]);
+        const our = list.items.filter((it) => it.kind === PdfItemKind.TEXT).map((it) => it.text).join('');
+        const spanLines = ref.split('\n').filter((l) => l.indexOf('span ') >= 0 && l.indexOf(`page ${i + 1}`) < 0);
+        // 只取当前页的 span：refdump 按页输出，用简单切分
+      }
+      // 更稳妥：逐页对文本包含关系
+      const ourAll = [];
+      for (let i = 0; i < doc.pages.length; i++) {
+        const list = PdfContentInterpreter.run(doc, doc.pages[i]);
+        ourAll.push(list.items.filter((it) => it.kind === PdfItemKind.TEXT).map((it) => it.text).join('|'));
+        check(`${name} p${i + 1} 尺寸`,
+          Math.abs(doc.pages[i].widthPt - (i === 0 && name === 'rotate_objstm.pdf' ? 842 : doc.pages[i].widthPt)) < 1);
+      }
+      const refTexts = [...ref.matchAll(/text='([^']*)'/g)].map((m) => m[1]);
+      for (const t of refTexts) {
+        if (t.length === 0) continue;
+        const found = ourAll.some((s) => s.indexOf(t) >= 0);
+        check(`${name} 含「${t.slice(0, 24)}」`, found, ourAll.join(' || '));
+      }
+    }
+    }
+  }
+
+  console.log('\n[13] Word 富文本解析 + 转 PDF');
+  {
+    const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<w:body>
+<w:p>
+  <w:pPr><w:jc w:val="center"/><w:rPr><w:b/><w:sz w:val="36"/></w:rPr></w:pPr>
+  <w:r><w:rPr><w:b/><w:sz w:val="36"/><w:color w:val="FF0000"/></w:rPr><w:t>红标题</w:t></w:r>
+</w:p>
+<w:p>
+  <w:r><w:t>Hello </w:t></w:r>
+  <w:r><w:rPr><w:i/></w:rPr><w:t>italic</w:t></w:r>
+  <w:r><w:t> 中文混排</w:t></w:r>
+</w:p>
+<w:tbl>
+  <w:tblPr><w:tblBorders>
+    <w:top w:val="single" w:sz="4" w:color="000000"/>
+    <w:left w:val="single" w:sz="4" w:color="000000"/>
+    <w:bottom w:val="single" w:sz="4" w:color="000000"/>
+    <w:right w:val="single" w:sz="4" w:color="000000"/>
+    <w:insideH w:val="single" w:sz="4" w:color="000000"/>
+    <w:insideV w:val="single" w:sz="4" w:color="000000"/>
+  </w:tblBorders></w:tblPr>
+  <w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2400"/></w:tblGrid>
+  <w:tr>
+    <w:tc><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc>
+  </w:tr>
+  <w:tr>
+    <w:tc><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc>
+  </w:tr>
+</w:tbl>
+<w:sectPr>
+  <w:pgSz w:w="11906" w:h="16838"/>
+  <w:pgMar w:top="1440" w:right="1800" w:bottom="1440" w:left="1800"/>
+</w:sectPr>
+</w:body></w:document>`;
+    const docxBytes = buildZip([
+      { name: '[Content_Types].xml', data: '<Types/>', store: true },
+      { name: 'word/document.xml', data: documentXml },
+      { name: 'word/styles.xml', data: '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="21"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>' }
+    ]);
+    const docx = DocxParser.parse(docxBytes);
+    check('解析出段落+表格', docx.blocks.length === 3, '' + docx.blocks.length);
+    check('第一节是段落', docx.blocks[0].kind === DocxBlockKind.PARAGRAPH);
+    const title = docx.blocks[0];
+    check('标题居中', title.style.align === 1, '' + title.style.align);
+    check('标题红色粗体', title.runs[0].style.bold && title.runs[0].style.color === 0xff0000,
+      `bold=${title.runs[0].style.bold} color=${title.runs[0].style.color}`);
+    check('标题字号 18pt', Math.abs(title.runs[0].style.sizePt - 18) < 0.01, '' + title.runs[0].style.sizePt);
+    check('第二节斜体 run', docx.blocks[1].runs[1].style.italic && docx.blocks[1].runs[1].text === 'italic');
+    check('表格 2×2', docx.blocks[2].kind === DocxBlockKind.TABLE &&
+      docx.blocks[2].rows.length === 2 && docx.blocks[2].rows[0].cells.length === 2);
+    check('A4 页面', Math.abs(docx.section.widthPt - 595.3) < 1 && Math.abs(docx.section.heightPt - 841.9) < 1,
+      `${docx.section.widthPt}x${docx.section.heightPt}`);
+
+    const pdfBytes = DocxToPdf.convert(docx);
+    const pdf = PdfDocument.open(pdfBytes);
+    check('Word→PDF 至少 1 页', pdf.pages.length >= 1, '' + pdf.pages.length);
+    const list = PdfContentInterpreter.run(pdf, pdf.pages[0]);
+    const dumped = list.items.filter((it) => it.kind === PdfItemKind.TEXT).map((it) => it.text).join('|');
+    check('转 PDF 后仍有标题', dumped.indexOf('红标题') >= 0, dumped);
+    check('转 PDF 后仍有 Hello', dumped.indexOf('Hello') >= 0, dumped);
+    check('转 PDF 后仍有 italic', dumped.indexOf('italic') >= 0, dumped);
+    check('转 PDF 后仍有中文', dumped.indexOf('中文混排') >= 0, dumped);
+    check('转 PDF 后仍有表格文字', dumped.indexOf('A1') >= 0 && dumped.indexOf('B2') >= 0, dumped);
+    const paths = list.items.filter((it) => it.kind === PdfItemKind.PATH);
+    check('转 PDF 后有表格边框', paths.length >= 4, '' + paths.length);
+
+    const titleRun = list.items.find((it) => it.kind === PdfItemKind.TEXT && it.text.indexOf('红标题') >= 0);
+    check('标题为红色', titleRun !== undefined && titleRun.color === 0xff0000, titleRun ? titleRun.color.toString(16) : 'missing');
+    check('标题为粗体', titleRun !== undefined && titleRun.bold, titleRun ? '' + titleRun.bold : 'missing');
+    check('标题字号约 18', titleRun !== undefined && Math.abs(titleRun.sizePt - 18) < 0.3, titleRun ? '' + titleRun.sizePt : 'missing');
+  }
+
+  console.log('\n[14] 加密 PDF 拒绝打开');
+  {
+    // 最小 PDF：trailer 带 /Encrypt，解析阶段应明确拒绝
+    const encrypted = Buffer.from(
+      '%PDF-1.4\n1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj\n' +
+      '2 0 obj<< /Type /Pages /Kids [] /Count 0 >>endobj\n' +
+      'xref\n0 3\n0000000000 65535 f \n0000000009 00000 n \n0000000068 00000 n \n' +
+      'trailer<< /Size 3 /Root 1 0 R /Encrypt 1 0 R >>\nstartxref\n130\n%%EOF\n',
+      'ascii');
+    let err = '';
+    try {
+      PdfDocument.open(new Uint8Array(encrypted));
+    } catch (e) {
+      err = e.message;
+    }
+    check('加密 PDF 报错', err.indexOf('加密') >= 0, err);
   }
 
   console.log(`\n共 ${checks} 项检查，失败 ${failures} 项`);

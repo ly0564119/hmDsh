@@ -14,7 +14,7 @@ import { common2D, drawing } from '@kit.ArkGraphics2D';
 import { image } from '@kit.ImageKit';
 import { Constants } from '../common/Constants';
 import { EscPrGeometry } from './EscPrEncoder';
-import { PageContent, TextLine, LineSeg } from './PageContent';
+import { DrawKind, DrawOp, ImageBox, PageContent, PathOp, PathShape, StyledText, TextLine, LineSeg } from './PageContent';
 import { RgbImage } from './RasterImage';
 import { TextFont } from './TextFont';
 
@@ -89,10 +89,18 @@ class PagePixelMap {
  */
 class PagePainter {
   private readonly sampling: drawing.SamplingOptions;
-  /** 文字画刷（黑色，开抗锯齿） */
+  /** 文字画刷（颜色按 run 切换） */
   private readonly textBrush: drawing.Brush;
+  /** 填充画刷 */
+  private readonly fillBrush: drawing.Brush;
+  /** 描边画笔 */
+  private readonly strokePen: drawing.Pen;
   /** 网格线画笔（灰色细线） */
   private readonly gridPen: drawing.Pen;
+  /** 预览时的线宽放大系数（页面坐标） */
+  private readonly strokeScale: number;
+  /** 按「字号_粗_斜」缓存的字型，避免每个 run 都 new Font */
+  private readonly fontCache: Map<string, TextFont> = new Map<string, TextFont>();
 
   /**
    * @param strokeWidth 网格线宽度，单位是「页面坐标」；
@@ -106,6 +114,12 @@ class PagePainter {
     this.textBrush.setColor(black);
     this.textBrush.setAntiAlias(true);
 
+    this.fillBrush = new drawing.Brush();
+    this.fillBrush.setAntiAlias(true);
+    this.strokePen = new drawing.Pen();
+    this.strokePen.setAntiAlias(true);
+    this.strokeScale = Math.max(1, strokeWidth);
+
     this.gridPen = new drawing.Pen();
     const gray: common2D.Color = { alpha: 255, red: 120, green: 120, blue: 120 };
     this.gridPen.setColor(gray);
@@ -116,18 +130,50 @@ class PagePainter {
   /** 按页面坐标绘制一页（或一页中的一段） */
   paint(canvas: drawing.Canvas, content: PageContent, font: TextFont,
     clipTop: number, clipBottom: number): void {
+    if (content.ops.length > 0) {
+      this.paintOps(canvas, content, clipTop, clipBottom);
+      return;
+    }
     this.paintImage(canvas, content, clipTop, clipBottom);
     this.paintStrokes(canvas, content, clipTop, clipBottom);
     this.paintTexts(canvas, content, font, clipTop, clipBottom);
   }
 
+  /** PDF 页：按绘制顺序交错画色块、图片、文字 */
+  private paintOps(canvas: drawing.Canvas, content: PageContent,
+    clipTop: number, clipBottom: number): void {
+    for (let i = 0; i < content.ops.length; i++) {
+      const op: DrawOp = content.ops[i];
+      if (op.kind === DrawKind.IMAGE && op.image !== null) {
+        this.paintImageBox(canvas, op.image, clipTop, clipBottom);
+      } else if (op.kind === DrawKind.PATH && op.path !== null) {
+        this.paintPath(canvas, op.path, clipTop, clipBottom);
+      } else if (op.kind === DrawKind.TEXT && op.text !== null) {
+        this.paintStyled(canvas, op.text, clipTop, clipBottom);
+      }
+    }
+  }
+
+  /** 0xRRGGBB → drawing 颜色 */
+  private static toColor(rgb: number): common2D.Color {
+    return {
+      alpha: 255,
+      red: (rgb >> 16) & 0xff,
+      green: (rgb >> 8) & 0xff,
+      blue: rgb & 0xff
+    };
+  }
+
   /** 画照片（整张图一次性交给画布，由画布做缩放与裁剪） */
   private paintImage(canvas: drawing.Canvas, content: PageContent,
     clipTop: number, clipBottom: number): void {
-    const box = content.imageBox;
-    if (box === null) {
-      return;
+    if (content.imageBox !== null) {
+      this.paintImageBox(canvas, content.imageBox, clipTop, clipBottom);
     }
+  }
+
+  private paintImageBox(canvas: drawing.Canvas, box: ImageBox,
+    clipTop: number, clipBottom: number): void {
     if (box.top + box.height < clipTop || box.top > clipBottom) {
       return;
     }
@@ -138,6 +184,177 @@ class PagePainter {
       bottom: box.top + box.height
     };
     canvas.drawImageRect(box.pixelMap, dst, this.sampling);
+  }
+
+  /** 画 PDF 矢量路径 */
+  private paintPath(canvas: drawing.Canvas, shape: PathShape,
+    clipTop: number, clipBottom: number): void {
+    const box = PagePainter.pathBounds(shape.cmds);
+    if (box === null) {
+      return;
+    }
+    const pad = shape.strokeWidth;
+    if (box[3] < clipTop - pad || box[1] > clipBottom + pad) {
+      return;
+    }
+    const path = PagePainter.buildPath(shape);
+    if (path === null) {
+      return;
+    }
+    if (shape.hasFill) {
+      this.fillBrush.setColor(PagePainter.toColor(shape.fillColor));
+      canvas.attachBrush(this.fillBrush);
+      canvas.drawPath(path);
+      canvas.detachBrush();
+    }
+    if (shape.hasStroke) {
+      this.strokePen.setColor(PagePainter.toColor(shape.strokeColor));
+      this.strokePen.setStrokeWidth(Math.max(this.strokeScale * 0.15, shape.strokeWidth));
+      canvas.attachPen(this.strokePen);
+      canvas.drawPath(path);
+      canvas.detachPen();
+    }
+  }
+
+  /** 扁平指令 → drawing.Path */
+  private static buildPath(shape: PathShape): drawing.Path | null {
+    const cmds = shape.cmds;
+    if (cmds.length === 0) {
+      return null;
+    }
+    const path = new drawing.Path();
+    try {
+      path.setFillType(shape.evenOdd
+        ? drawing.PathFillType.EVEN_ODD
+        : drawing.PathFillType.WINDING);
+    } catch (e) {
+      // 旧 API 没有 FillType 就按默认非零环绕
+    }
+    let i = 0;
+    while (i < cmds.length) {
+      const op = cmds[i];
+      i++;
+      if (op === PathOp.MOVE && i + 1 < cmds.length) {
+        path.moveTo(cmds[i], cmds[i + 1]);
+        i += 2;
+      } else if (op === PathOp.LINE && i + 1 < cmds.length) {
+        path.lineTo(cmds[i], cmds[i + 1]);
+        i += 2;
+      } else if (op === PathOp.CUBIC && i + 5 < cmds.length) {
+        try {
+          path.cubicTo(cmds[i], cmds[i + 1], cmds[i + 2], cmds[i + 3], cmds[i + 4], cmds[i + 5]);
+        } catch (e) {
+          path.lineTo(cmds[i + 4], cmds[i + 5]);
+        }
+        i += 6;
+      } else if (op === PathOp.CLOSE) {
+        path.close();
+      } else {
+        break;
+      }
+    }
+    return path;
+  }
+
+  /** 路径包围盒，用于带裁剪 */
+  private static pathBounds(cmds: number[]): number[] | null {
+    let minX = Number.MAX_VALUE;
+    let minY = Number.MAX_VALUE;
+    let maxX = -Number.MAX_VALUE;
+    let maxY = -Number.MAX_VALUE;
+    let i = 0;
+    let n = 0;
+    while (i < cmds.length) {
+      const op = cmds[i];
+      i++;
+      let points = 0;
+      if (op === PathOp.MOVE || op === PathOp.LINE) {
+        points = 1;
+      } else if (op === PathOp.CUBIC) {
+        points = 3;
+      }
+      for (let k = 0; k < points && i + 1 < cmds.length; k++) {
+        const x = cmds[i];
+        const y = cmds[i + 1];
+        i += 2;
+        n++;
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+      }
+    }
+    return n === 0 ? null : [minX, minY, maxX, maxY];
+  }
+
+  /** 画 PDF 带样式文字（位置与宽度都按 PDF 度量走） */
+  private paintStyled(canvas: drawing.Canvas, run: StyledText,
+    clipTop: number, clipBottom: number): void {
+    const size = run.sizePx;
+    if (size <= 0.4 || run.text.length === 0) {
+      return;
+    }
+    const top = run.y - size;
+    const bottom = run.y + size * 0.35;
+    if (bottom < clipTop || top > clipBottom) {
+      return;
+    }
+    const font = this.styledFont(size, run.bold, run.italic);
+    this.textBrush.setColor(PagePainter.toColor(run.color));
+    canvas.attachBrush(this.textBrush);
+    const rotated = Math.abs(run.rotationDeg) > 0.4;
+    if (rotated) {
+      canvas.save();
+      canvas.translate(run.x, run.y);
+      try {
+        canvas.rotate(run.rotationDeg, 0, 0);
+      } catch (e) {
+        canvas.rotate(run.rotationDeg);
+      }
+    }
+    const originX = rotated ? 0 : run.x;
+    const originY = rotated ? 0 : run.y;
+    let x = originX;
+    const text = run.text;
+    let p = 0;
+    let gi = 0;
+    while (p < text.length) {
+      const len = TextFont.charLengthAt(text, p);
+      const ch = text.substring(p, p + len);
+      p += len;
+      const advance = gi < run.advances.length ? run.advances[gi] : font.charWidth(ch);
+      gi++;
+      if (ch !== ' ') {
+        try {
+          if (len === 1) {
+            canvas.drawSingleCharacter(ch, font.font, x, originY);
+          } else {
+            const blob = drawing.TextBlob.makeFromString(ch, font.font,
+              drawing.TextEncoding.TEXT_ENCODING_UTF8);
+            canvas.drawTextBlob(blob, x, originY);
+          }
+        } catch (e) {
+          // 个别字符画不出来就跳过
+        }
+      }
+      x += advance;
+    }
+    canvas.detachBrush();
+    if (rotated) {
+      canvas.restore();
+    }
+  }
+
+  /** 取（或创建）指定字号/粗斜体的字型 */
+  private styledFont(sizePx: number, bold: boolean, italic: boolean): TextFont {
+    const key = Math.round(sizePx * 20) + (bold ? '_B' : '') + (italic ? '_I' : '');
+    const cached = this.fontCache.get(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const font = new TextFont(Math.max(4, sizePx), bold, italic);
+    this.fontCache.set(key, font);
+    return font;
   }
 
   /** 画表格网格线 */
