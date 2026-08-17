@@ -11,6 +11,7 @@
  */
 
 import { PngDecoder } from '../common/PngDecoder';
+import { BmpDecoder } from '../common/BmpDecoder';
 import { PdfStdFonts } from '../pdf/PdfStdFonts';
 import {
   PdfBuilder,
@@ -491,13 +492,21 @@ export class DocxToPdf {
       return payload;
     }
     const png = PngDecoder.decode(image.data);
-    if (png === null) {
+    if (png !== null) {
+      payload.isJpeg = false;
+      payload.widthPx = png.width;
+      payload.heightPx = png.height;
+      payload.data = png.rgb;
+      return payload;
+    }
+    const bmp = BmpDecoder.decode(image.data);
+    if (bmp === null) {
       return null;
     }
     payload.isJpeg = false;
-    payload.widthPx = png.width;
-    payload.heightPx = png.height;
-    payload.data = png.rgb;
+    payload.widthPx = bmp.width;
+    payload.heightPx = bmp.height;
+    payload.data = bmp.rgb;
     return payload;
   }
 

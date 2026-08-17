@@ -50,6 +50,35 @@ export class XmlNode {
     return '';
   }
 
+  /**
+   * 精确属性名，不做「r:id → id」这种本地名回退。
+   * Word 的 wp:docPr 有数字 id（绘图编号），和关系 r:id 不是一回事；
+   * 找图片关系时必须用这个，否则所有图片都会丢。
+   */
+  attrExact(name: string): string {
+    const v = this.attrs.get(name);
+    return v !== undefined ? v : '';
+  }
+
+  /**
+   * 按本地名取属性：`r:embed`、`embed`、`ns1:embed` 都能命中。
+   * 不要用这个取 `id`——会把 wp:docPr 的绘图编号当成关系 ID。
+   */
+  attrLocal(localName: string): string {
+    const exact = this.attrs.get(localName);
+    if (exact !== undefined) {
+      return exact;
+    }
+    const suffix = ':' + localName;
+    let found = '';
+    this.attrs.forEach((value: string, key: string) => {
+      if (found.length === 0 && key.endsWith(suffix)) {
+        found = value;
+      }
+    });
+    return found;
+  }
+
   /** 是否有该属性 */
   hasAttr(name: string): boolean {
     return this.attrs.has(name);

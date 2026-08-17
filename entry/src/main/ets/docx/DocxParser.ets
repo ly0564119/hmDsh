@@ -14,6 +14,8 @@
 
 import { ZipArchive } from '../common/ZipReader';
 import { XmlNode, XmlParser } from '../common/XmlParser';
+import { PngDecoder } from '../common/PngDecoder';
+import { BmpDecoder } from '../common/BmpDecoder';
 import {
   DocxAlign,
   DocxBlock,
@@ -787,7 +789,7 @@ export class DocxParser {
    * 超链接（w:hyperlink）、智能标签、修订插入（w:ins）里的 run 也要收进来。
    */
   private collectRuns(node: XmlNode, baseStyle: DocxRunStyle, out: DocxRun[], depth: number): void {
-    if (depth > 12) {
+    if (depth > 24) {
       return;
     }
     for (let i = 0; i < node.children.length; i++) {
@@ -812,12 +814,32 @@ export class DocxParser {
         this.collectRuns(child, baseStyle, out, depth + 1);
         continue;
       }
+      if (name === 'AlternateContent') {
+        this.collectAlternate(child, baseStyle, out, depth + 1);
+        continue;
+      }
       if (name === 'del' || name === 'pPr' || name === 'rPr') {
         continue; // 删除的修订内容不打印
       }
       if (child.children.length > 0) {
         this.collectRuns(child, baseStyle, out, depth + 1);
       }
+    }
+  }
+
+  /**
+   * mc:AlternateContent：优先走 mc:Choice（DrawingML），没有再走 VML Fallback。
+   * 两个都挖会把同一张图解析两遍。
+   */
+  private collectAlternate(node: XmlNode, baseStyle: DocxRunStyle, out: DocxRun[], depth: number): void {
+    const choice = node.child('Choice');
+    if (choice !== null) {
+      this.collectRuns(choice, baseStyle, out, depth);
+      return;
+    }
+    const fallback = node.child('Fallback');
+    if (fallback !== null) {
+      this.collectRuns(fallback, baseStyle, out, depth);
     }
   }
 
@@ -881,15 +903,25 @@ export class DocxParser {
         out.push(run);
         continue;
       }
+      if (name === 'AlternateContent') {
+        this.collectAlternate(child, style, out, 1);
+        continue;
+      }
+      // Word 2010+ 常把图片包在 mc:Choice 之外的容器里，继续往里挖
+      if (child.children.length > 0 && name !== 'rPr') {
+        this.collectRuns(child, style, out, 1);
+      }
     }
   }
 
   /**
    * 解析图片：从 w:drawing / w:pict 里找关系 ID 与显示尺寸。
-   * 找不到尺寸时按图片自身像素当 96dpi 估算。
+   *
+   * 关键坑：wp:docPr 有一个数字 `id`（绘图编号），和关系 `r:id` 不是一回事。
+   * 必须先找 `r:embed`，绝不能把裸 `id` 当成关系。
    */
   private parseImage(node: XmlNode): DocxImage | null {
-    const embedId = DocxParser.findEmbedId(node, 0);
+    const embedId = DocxParser.findEmbedId(node);
     if (embedId.length === 0) {
       return null;
     }
@@ -899,12 +931,8 @@ export class DocxParser {
     }
     let data = this.mediaCache.get(target);
     if (data === undefined) {
-      if (!this.archive.has(target)) {
-        return null;
-      }
-      try {
-        data = this.archive.read(target);
-      } catch (e) {
+      data = this.readMedia(target);
+      if (data === null) {
         return null;
       }
       this.mediaCache.set(target, data);
@@ -912,13 +940,52 @@ export class DocxParser {
     const image = new DocxImage();
     image.data = data;
     image.ext = DocxParser.extensionOf(target);
+    this.applyImageSize(node, image);
+    if (image.widthPt <= 0 || image.heightPt <= 0) {
+      // 没有版式尺寸就按像素、96dpi 估算，总比把图丢掉好
+      const px = DocxParser.imagePixelSize(data);
+      if (px !== null) {
+        image.widthPt = px[0] * 72 / 96;
+        image.heightPt = px[1] * 72 / 96;
+      }
+    }
+    if (image.widthPt <= 0 || image.heightPt <= 0) {
+      image.widthPt = 160;
+      image.heightPt = 120;
+    }
+    return image;
+  }
+
+  /** 从 ZIP 读媒体文件；路径斜杠/大小写对不上时由 ZipArchive 兜底 */
+  private readMedia(target: string): Uint8Array | null {
+    if (target.length === 0) {
+      return null;
+    }
+    if (!this.archive.has(target)) {
+      return null;
+    }
+    try {
+      return this.archive.read(target);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 显示尺寸：wp:extent（EMU）→ a:ext → VML style */
+  private applyImageSize(node: XmlNode, image: DocxImage): void {
     const extent = DocxParser.findNode(node, 'extent', 0);
     if (extent !== null) {
       image.widthPt = DocxUnits.emuToPt(DocxParser.parseNum(extent.attr('cx'), 0));
       image.heightPt = DocxUnits.emuToPt(DocxParser.parseNum(extent.attr('cy'), 0));
     }
     if (image.widthPt <= 0 || image.heightPt <= 0) {
-      // VML 图片（w:pict）的尺寸在 style 属性里，如 `width:120pt;height:80pt`
+      const ext = DocxParser.findSizedExt(node, 0);
+      if (ext !== null) {
+        image.widthPt = DocxUnits.emuToPt(DocxParser.parseNum(ext.attr('cx'), 0));
+        image.heightPt = DocxUnits.emuToPt(DocxParser.parseNum(ext.attr('cy'), 0));
+      }
+    }
+    if (image.widthPt <= 0 || image.heightPt <= 0) {
       const shape = DocxParser.findNode(node, 'shape', 0);
       if (shape !== null) {
         const style = shape.attr('style');
@@ -926,27 +993,49 @@ export class DocxParser {
         image.heightPt = DocxParser.cssLength(style, 'height');
       }
     }
-    if (image.widthPt <= 0 || image.heightPt <= 0) {
-      return null; // 尺寸未知的图片跳过，避免排版错乱
-    }
-    return image;
   }
 
-  /** 递归找 r:embed / r:id 属性 */
-  private static findEmbedId(node: XmlNode, depth: number): string {
-    if (depth > 12) {
-      return '';
+  /** 找带 cx/cy 的 a:ext（图片变换框），不要误匹配 extLst */
+  private static findSizedExt(node: XmlNode, depth: number): XmlNode | null {
+    if (depth > 24) {
+      return null;
     }
-    const embed = node.attr('r:embed');
+    if (node.localName === 'ext' && (node.attr('cx').length > 0 || node.attr('cy').length > 0)) {
+      return node;
+    }
+    for (let i = 0; i < node.children.length; i++) {
+      const found = DocxParser.findSizedExt(node.children[i], depth + 1);
+      if (found !== null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 找图片关系 ID。
+   * 第一遍只认 embed（DrawingML 的 a:blip r:embed）；
+   * 找不到再认 VML 的 r:id / o:relid。绝不把裸 id 当成关系。
+   */
+  private static findEmbedId(node: XmlNode): string {
+    const embed = DocxParser.findAttrDeep(node, 'embed', 0);
     if (embed.length > 0) {
       return embed;
     }
-    const id = node.attr('r:id');
-    if (id.length > 0) {
-      return id;
+    return DocxParser.findRelationshipIdDeep(node, 0);
+  }
+
+  /** 整棵子树里按本地名找属性（r:embed / ns0:embed / embed） */
+  private static findAttrDeep(node: XmlNode, localName: string, depth: number): string {
+    if (depth > 24) {
+      return '';
+    }
+    const v = node.attrLocal(localName);
+    if (v.length > 0) {
+      return v;
     }
     for (let i = 0; i < node.children.length; i++) {
-      const found = DocxParser.findEmbedId(node.children[i], depth + 1);
+      const found = DocxParser.findAttrDeep(node.children[i], localName, depth + 1);
       if (found.length > 0) {
         return found;
       }
@@ -954,9 +1043,87 @@ export class DocxParser {
     return '';
   }
 
+  /** VML / 链接图：带前缀的 r:id，跳过超链接 */
+  private static findRelationshipIdDeep(node: XmlNode, depth: number): string {
+    if (depth > 24) {
+      return '';
+    }
+    if (node.localName !== 'hlinkClick' && node.localName !== 'hlinkHover') {
+      const rid = node.attrExact('r:id');
+      if (rid.length > 0) {
+        return rid;
+      }
+      // 其它前缀的 :id（ns1:id），但不要裸 id
+      let prefixedId = '';
+      node.attrs.forEach((value: string, key: string) => {
+        if (prefixedId.length === 0 && key.endsWith(':id') && key !== 'xml:id') {
+          prefixedId = value;
+        }
+      });
+      if (prefixedId.length > 0) {
+        return prefixedId;
+      }
+      const relid = node.attrLocal('relid');
+      if (relid.length > 0) {
+        return relid;
+      }
+      if (node.localName === 'blip') {
+        const link = node.attrLocal('link');
+        if (link.length > 0) {
+          return link;
+        }
+      }
+    }
+    for (let i = 0; i < node.children.length; i++) {
+      const found = DocxParser.findRelationshipIdDeep(node.children[i], depth + 1);
+      if (found.length > 0) {
+        return found;
+      }
+    }
+    return '';
+  }
+
+  /** JPEG / PNG / BMP 文件头里的像素尺寸 */
+  private static imagePixelSize(data: Uint8Array): number[] | null {
+    if (data.length >= 2 && data[0] === 0xff && data[1] === 0xd8) {
+      return DocxParser.jpegSize(data);
+    }
+    const png = PngDecoder.size(data);
+    if (png !== null) {
+      return png;
+    }
+    return BmpDecoder.size(data);
+  }
+
+  /** 从 JPEG 文件头读像素尺寸 */
+  private static jpegSize(data: Uint8Array): number[] | null {
+    let i = 2;
+    while (i + 8 < data.length) {
+      if (data[i] !== 0xff) {
+        i++;
+        continue;
+      }
+      const marker = data[i + 1];
+      if (marker === 0xd8 || marker === 0xd9 || marker === 0x01) {
+        i += 2;
+        continue;
+      }
+      const len = (data[i + 2] << 8) | data[i + 3];
+      if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc9 && marker <= 0xcb)) {
+        if (i + 8 < data.length) {
+          const h = (data[i + 5] << 8) | data[i + 6];
+          const w = (data[i + 7] << 8) | data[i + 8];
+          return [w, h];
+        }
+      }
+      i += 2 + len;
+    }
+    return null;
+  }
+
   /** 递归按本地名找第一个节点 */
   private static findNode(node: XmlNode, localName: string, depth: number): XmlNode | null {
-    if (depth > 12) {
+    if (depth > 24) {
       return null;
     }
     if (node.localName === localName) {

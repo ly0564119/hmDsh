@@ -44,6 +44,22 @@ export class PngDecoder {
   }
 
   /**
+   * 只读 IHDR 拿像素尺寸，不解码像素。
+   * 解析 Word 图片时若缺少 wp:extent，用这个按 96dpi 估显示尺寸。
+   */
+  static size(data: Uint8Array): number[] | null {
+    if (!PngDecoder.isPng(data) || data.length < 24) {
+      return null;
+    }
+    const width = PngDecoder.readU32(data, 16);
+    const height = PngDecoder.readU32(data, 20);
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) {
+      return null;
+    }
+    return [width, height];
+  }
+
+  /**
    * 解码。
    * @returns RGB 位图；格式不支持或数据损坏返回 null
    */
