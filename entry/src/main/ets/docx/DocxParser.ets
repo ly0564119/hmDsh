@@ -929,13 +929,18 @@ export class DocxParser {
     if (target === undefined) {
       return null;
     }
-    let data = this.mediaCache.get(target);
-    if (data === undefined) {
-      data = this.readMedia(target);
-      if (data === null) {
+    // Map.get 是 undefined，readMedia 是 null，ArkTS 不允许混用，这里拆开赋值
+    let data: Uint8Array;
+    const cached = this.mediaCache.get(target);
+    if (cached !== undefined) {
+      data = cached;
+    } else {
+      const loaded = this.readMedia(target);
+      if (loaded === null) {
         return null;
       }
-      this.mediaCache.set(target, data);
+      this.mediaCache.set(target, loaded);
+      data = loaded;
     }
     const image = new DocxImage();
     image.data = data;
