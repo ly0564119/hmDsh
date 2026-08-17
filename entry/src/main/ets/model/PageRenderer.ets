@@ -306,11 +306,8 @@ class PagePainter {
     if (rotated) {
       canvas.save();
       canvas.translate(run.x, run.y);
-      try {
-        canvas.rotate(run.rotationDeg, 0, 0);
-      } catch (e) {
-        canvas.rotate(run.rotationDeg);
-      }
+      // drawing.Canvas.rotate 只有三参数签名：角度 + 旋转中心
+      canvas.rotate(run.rotationDeg, 0, 0);
     }
     const originX = rotated ? 0 : run.x;
     const originY = rotated ? 0 : run.y;
