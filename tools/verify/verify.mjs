@@ -90,7 +90,9 @@ function buildZip(entries) {
   let offset = 0;
   for (const entry of entries) {
     const nameBytes = Buffer.from(entry.name, 'utf8');
-    const raw = Buffer.from(entry.data, 'utf8');
+    const raw = Buffer.isBuffer(entry.data) || entry.data instanceof Uint8Array
+      ? Buffer.from(entry.data)
+      : Buffer.from(String(entry.data), 'utf8');
     const store = entry.store === true;
     const body = store ? raw : deflateRawSync(raw);
     const local = Buffer.alloc(30);
@@ -585,6 +587,10 @@ async function main() {
     check('子元素文本', root.child('w:t') !== null && root.child('w:t').text === 'A <B>');
     check('自闭合', root.childrenNamed('child').length === 1);
     check('数字实体', XmlParser.decodeEntities('&#65;&#x42;') === 'AB');
+    const docPr = XmlParser.parse('<wp:docPr id="1" name="Picture 1" r:embed="rId4"/>');
+    check('attr(r:id) 会误命中裸 id（旧坑）', docPr.attr('r:id') === '1', docPr.attr('r:id'));
+    check('attrExact(r:id) 不回退到裸 id', docPr.attrExact('r:id') === '');
+    check('attrLocal(embed) 命中 r:embed', docPr.attrLocal('embed') === 'rId4');
   }
 
   console.log('\n[9] PDF 词法 / 过滤器');
@@ -788,6 +794,85 @@ async function main() {
     check('标题为红色', titleRun !== undefined && titleRun.color === 0xff0000, titleRun ? titleRun.color.toString(16) : 'missing');
     check('标题为粗体', titleRun !== undefined && titleRun.bold, titleRun ? '' + titleRun.bold : 'missing');
     check('标题字号约 18', titleRun !== undefined && Math.abs(titleRun.sizePt - 18) < 0.3, titleRun ? '' + titleRun.sizePt : 'missing');
+  }
+
+  {
+    // 模拟 Word 插入图片：wp:docPr 带数字 id，a:blip 带 r:embed。
+    // 旧实现会把 docPr 的 id="1" 当成关系 ID，图片全部丢失。
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC',
+      'base64');
+    const drawing = `
+<w:r>
+  <mc:AlternateContent>
+    <mc:Choice Requires="wps">
+      <w:drawing>
+        <wp:inline>
+          <wp:extent cx="914400" cy="914400"/>
+          <wp:docPr id="1" name="图片 1"/>
+          <a:graphic>
+            <a:graphicData>
+              <pic:pic>
+                <pic:blipFill>
+                  <a:blip r:embed="rId4"/>
+                </pic:blipFill>
+              </pic:pic>
+            </a:graphicData>
+          </a:graphic>
+        </wp:inline>
+      </w:drawing>
+    </mc:Choice>
+    <mc:Fallback>
+      <w:pict>
+        <v:shape style="width:72pt;height:72pt">
+          <v:imagedata r:id="rId4"/>
+        </v:shape>
+      </w:pict>
+    </mc:Fallback>
+  </mc:AlternateContent>
+</w:r>`;
+    const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+  xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+  xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+  xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
+  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+  xmlns:v="urn:schemas-microsoft-com:vml">
+<w:body>
+<w:p><w:r><w:t>before</w:t></w:r>${drawing}<w:r><w:t>after</w:t></w:r></w:p>
+<w:sectPr>
+  <w:pgSz w:w="11906" w:h="16838"/>
+  <w:pgMar w:top="1440" w:right="1800" w:bottom="1440" w:left="1800"/>
+</w:sectPr>
+</w:body></w:document>`;
+    const relsXml = `<?xml version="1.0"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/>
+</Relationships>`;
+    const imgDocx = DocxParser.parse(buildZip([
+      { name: '[Content_Types].xml', data: '<Types/>', store: true },
+      { name: 'word/document.xml', data: documentXml },
+      { name: 'word/_rels/document.xml.rels', data: relsXml, store: true },
+      { name: 'word/media/image1.png', data: png, store: true }
+    ]));
+    const imgRuns = imgDocx.blocks[0].runs;
+    const imgRun = imgRuns.find((r) => r.image !== null);
+    check('DrawingML 解析出图片 run', imgRun !== undefined && imgRun.image !== null);
+    check('图片不是被解析两次', imgRuns.filter((r) => r.image !== null).length === 1,
+      '' + imgRuns.filter((r) => r.image !== null).length);
+    check('图片字节完整', imgRun !== undefined && imgRun.image.data.length === png.length,
+      imgRun ? '' + imgRun.image.data.length : 'missing');
+    check('图片显示尺寸约 72pt', imgRun !== undefined && Math.abs(imgRun.image.widthPt - 72) < 0.1,
+      imgRun ? '' + imgRun.image.widthPt : 'missing');
+
+    const imgPdf = DocxToPdf.convert(imgDocx);
+    const imgOpened = PdfDocument.open(imgPdf);
+    const imgList = PdfContentInterpreter.run(imgOpened, imgOpened.pages[0]);
+    const images = imgList.items.filter((it) => it.kind === PdfItemKind.IMAGE);
+    check('Word→PDF 含图片 XObject', images.length >= 1, '' + images.length);
+    const dumped2 = imgList.items.filter((it) => it.kind === PdfItemKind.TEXT).map((it) => it.text).join('|');
+    check('带图文档文字仍在', dumped2.indexOf('before') >= 0 && dumped2.indexOf('after') >= 0, dumped2);
   }
 
   console.log('\n[14] 加密 PDF 拒绝打开');

@@ -109,12 +109,33 @@ export class ZipArchive {
   }
 
   private find(name: string): ZipEntry | null {
+    const want = ZipArchive.normPath(name);
     for (let i = 0; i < this.entries.length; i++) {
-      if (this.entries[i].name === name) {
+      if (ZipArchive.normPath(this.entries[i].name) === want) {
+        return this.entries[i];
+      }
+    }
+    // Word / WPS 有时大小写不一致（Word/media vs word/media）
+    const lower = want.toLowerCase();
+    for (let i = 0; i < this.entries.length; i++) {
+      if (ZipArchive.normPath(this.entries[i].name).toLowerCase() === lower) {
         return this.entries[i];
       }
     }
     return null;
+  }
+
+  /** 统一斜杠，去掉开头的 ./ */
+  private static normPath(path: string): string {
+    let s = '';
+    for (let i = 0; i < path.length; i++) {
+      const c = path.charAt(i);
+      s += c === '\\' ? '/' : c;
+    }
+    if (s.startsWith('./')) {
+      return s.substring(2);
+    }
+    return s;
   }
 
   /**
