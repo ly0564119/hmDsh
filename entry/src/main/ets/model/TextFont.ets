@@ -20,10 +20,24 @@ export class TextFont {
   /** 单字宽度缓存：中文文档里重复字很多，缓存能显著减少测量开销 */
   private widthCache: Map<string, number> = new Map();
 
-  constructor(sizePx: number) {
+  constructor(sizePx: number, bold: boolean = false, italic: boolean = false) {
     this.sizePx = sizePx;
     this.font = new drawing.Font();
     this.font.setSize(sizePx);
+    if (bold) {
+      try {
+        this.font.setEmbolden(true);
+      } catch (e) {
+        // 个别机型没有伪粗体接口，用默认字重继续
+      }
+    }
+    if (italic) {
+      try {
+        this.font.setSkewX(-0.25);
+      } catch (e) {
+        // 没有伪斜体就保持正体
+      }
+    }
     try {
       const metrics = this.font.getMetrics();
       // drawing 的 ascent 是负值（基线以上），descent 为正值

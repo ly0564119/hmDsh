@@ -15,11 +15,17 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { Constants } from '../common/Constants';
 import { Utf8 } from '../common/Utf8';
 import { ZipArchive } from '../common/ZipReader';
+import { DocxParser } from '../docx/DocxParser';
+import { DocxToPdf } from '../docx/DocxToPdf';
+import { PdfContentInterpreter } from '../pdf/PdfContent';
+import { PdfDocument } from '../pdf/PdfDocument';
+import { PdfPageLayout } from '../pdf/PdfPageLayout';
 import { DocumentRasterizer } from './DocumentRasterizer';
 import { EscPrGeometry, EscPrJobOptions, EscPrJobWriter } from './EscPrEncoder';
 import { OfficeParser, XlsxSheet } from './OfficeParser';
 import { PageContent } from './PageContent';
 import { PagePreview, PageRenderer } from './PageRenderer';
+import { PdfPrint } from './PdfPrint';
 import { PrinterConnection } from './PrinterConnection';
 import { TextFont } from './TextFont';
 
@@ -28,12 +34,14 @@ export type PrintProgress = (message: string) => void;
 
 /** 待打印内容的来源：已解析完成，可按不同打印设置反复排版 */
 export class PrintSource {
-  /** 纯文字（.txt 与 .docx 提取结果都归到这里） */
+  /** 纯文字（.txt） */
   static readonly KIND_TEXT: string = 'text';
   /** 表格（.xlsx） */
   static readonly KIND_SHEET: string = 'sheet';
   /** 照片 */
   static readonly KIND_PHOTO: string = 'photo';
+  /** PDF 页面（直接打开的 .pdf，或 Word 转成的 PDF） */
+  static readonly KIND_PDF: string = 'pdf';
 
   readonly kind: string;
   /** 界面上显示的名字（文件名或类型描述） */
@@ -41,26 +49,33 @@ export class PrintSource {
   readonly text: string;
   readonly sheet: XlsxSheet | null;
   readonly photoUri: string;
+  /** 已打开的 PDF 文档（KIND_PDF 时有值） */
+  readonly pdf: PdfDocument | null;
 
   private constructor(kind: string, displayName: string, text: string,
-    sheet: XlsxSheet | null, photoUri: string) {
+    sheet: XlsxSheet | null, photoUri: string, pdf: PdfDocument | null) {
     this.kind = kind;
     this.displayName = displayName;
     this.text = text;
     this.sheet = sheet;
     this.photoUri = photoUri;
+    this.pdf = pdf;
   }
 
   static ofText(displayName: string, text: string): PrintSource {
-    return new PrintSource(PrintSource.KIND_TEXT, displayName, text, null, '');
+    return new PrintSource(PrintSource.KIND_TEXT, displayName, text, null, '', null);
   }
 
   static ofSheet(displayName: string, sheet: XlsxSheet): PrintSource {
-    return new PrintSource(PrintSource.KIND_SHEET, displayName, '', sheet, '');
+    return new PrintSource(PrintSource.KIND_SHEET, displayName, '', sheet, '', null);
   }
 
   static ofPhoto(displayName: string, uri: string): PrintSource {
-    return new PrintSource(PrintSource.KIND_PHOTO, displayName, '', null, uri);
+    return new PrintSource(PrintSource.KIND_PHOTO, displayName, '', null, uri, null);
+  }
+
+  static ofPdf(displayName: string, pdf: PdfDocument): PrintSource {
+    return new PrintSource(PrintSource.KIND_PDF, displayName, '', null, '', pdf);
   }
 }
 
@@ -149,14 +164,31 @@ export class PrintService {
     return PrintSource.ofText(displayName, text);
   }
 
-  /** 读取 .docx（提取正文文字） */
+  /**
+   * 读取 .docx：按段落/表格/图片排版成 PDF，再走 PDF 打印管线。
+   * 这样能保留字号、粗斜体、颜色、对齐、表格边框和内嵌图片，不再是纯文字版。
+   */
   static loadDocx(uri: string, displayName: string): PrintSource {
-    const archive = ZipArchive.open(PrintService.readBinaryFile(uri));
-    const text = OfficeParser.docxToText(archive);
-    if (text.trim().length === 0) {
-      throw new Error('这个 Word 文档里没有可提取的文字（可能整篇是图片或文本框）');
+    const bytes = PrintService.readBinaryFile(uri);
+    const docx = DocxParser.parse(bytes);
+    if (docx.blocks.length === 0) {
+      throw new Error('这个 Word 文档里没有可打印的内容');
     }
-    return PrintSource.ofText(displayName, text);
+    const pdfBytes = DocxToPdf.convert(docx);
+    const pdf = PdfDocument.open(pdfBytes);
+    if (pdf.pages.length === 0) {
+      throw new Error('Word 转 PDF 之后没有页面，请检查文档内容');
+    }
+    return PrintSource.ofPdf(displayName, pdf);
+  }
+
+  /** 读取 PDF */
+  static loadPdf(uri: string, displayName: string): PrintSource {
+    const pdf = PdfDocument.open(PrintService.readBinaryFile(uri));
+    if (pdf.pages.length === 0) {
+      throw new Error('这个 PDF 里没有可打印的页面');
+    }
+    return PrintSource.ofPdf(displayName, pdf);
   }
 
   /** 读取 .xlsx（取第一个工作表） */
@@ -193,6 +225,12 @@ export class PrintService {
         throw new Error('表格内容缺失');
       }
       pages = DocumentRasterizer.layoutGrid(sheet, font, size.width, size.height, req.marginPx());
+    } else if (source.kind === PrintSource.KIND_PDF) {
+      const pdf = source.pdf;
+      if (pdf === null) {
+        throw new Error('PDF 内容缺失');
+      }
+      pages = await PrintService.layoutPdf(req, pdf, size.width, size.height);
     } else {
       req.notify('正在排版…');
       pages = DocumentRasterizer.layoutText(source.text, font, size.width, size.height, req.marginPx());
@@ -201,6 +239,26 @@ export class PrintService {
       throw new Error('没有可打印的内容');
     }
     return new PrintJob(pages, font, geometry);
+  }
+
+  /**
+   * 把 PDF 各页缩放到当前纸张的可打印区并解码图片。
+   * 换纸张 / 分辨率时会重新走这里，所以预览和打印始终一致。
+   */
+  private static async layoutPdf(req: PrintRequest, pdf: PdfDocument,
+    pageWidth: number, pageHeight: number): Promise<PageContent[]> {
+    const infos = pdf.pages;
+    const pages: PageContent[] = [];
+    for (let i = 0; i < infos.length; i++) {
+      req.notify('正在排版第 ' + (i + 1) + '/' + infos.length + ' 页…');
+      const list = PdfContentInterpreter.run(pdf, infos[i]);
+      const laid = PdfPageLayout.fit(list, pageWidth, pageHeight);
+      for (let w = 0; w < laid.warnings.length; w++) {
+        req.notify(laid.warnings[w]);
+      }
+      pages.push(await PdfPrint.materialize(pdf, laid));
+    }
+    return pages;
   }
 
   /**
